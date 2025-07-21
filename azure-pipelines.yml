@@ -1,0 +1,270 @@
+trigger:
+  branches:
+    include:
+    - main
+    - develop
+  paths:
+    include:
+    - src/*
+    - tests/*
+    - *.yml
+    - *.yaml
+
+variables:
+  solution: '**/*.sln'
+  buildPlatform: 'Any CPU'
+  buildConfiguration: 'Release'
+  dotNetVersion: '8.0.x'
+
+stages:
+- stage: Build
+  displayName: 'Build and Test'
+  jobs:
+  - job: Build
+    displayName: 'Build and Test'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - task: UseDotNet@2
+      displayName: 'Use .NET 8.0'
+      inputs:
+        version: '8.0.x'
+        includePreviewVersions: false
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore NuGet packages'
+      inputs:
+        command: 'restore'
+        projects: '**/*.csproj'
+        feedsToUse: 'select'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Build solution'
+      inputs:
+        command: 'build'
+        projects: '**/*.sln'
+        arguments: '--configuration $(buildConfiguration) --no-restore'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Run unit tests'
+      inputs:
+        command: 'test'
+        projects: 'tests/Unit/UnitTests.csproj'
+        arguments: '--configuration $(buildConfiguration) --no-build --collect:"XPlat Code Coverage" --results-directory $(Build.SourcesDirectory)/TestResults'
+        publishTestResults: true
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Run integration tests'
+      inputs:
+        command: 'test'
+        projects: 'tests/Integration/IntegrationTests.csproj'
+        arguments: '--configuration $(buildConfiguration) --no-build --collect:"XPlat Code Coverage" --results-directory $(Build.SourcesDirectory)/TestResults'
+        publishTestResults: true
+
+    - task: PublishTestResults@2
+      displayName: 'Publish test results'
+      inputs:
+        testResultsFormat: 'VSTest'
+        testResultsFiles: '**/*.trx'
+        mergeTestResults: true
+        testRunTitle: 'ECommerce Tests'
+
+    - task: PublishCodeCoverageResults@1
+      displayName: 'Publish code coverage'
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '**/coverage.cobertura.xml'
+        reportDirectory: '**/TestResults'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Publish artifacts'
+      inputs:
+        command: 'publish'
+        projects: |
+          src/Services/ProductService/ProductService.csproj
+          src/Services/OrderService/OrderService.csproj
+          src/Services/PaymentService/PaymentService.csproj
+          src/Services/NotificationService/NotificationService.csproj
+          src/Services/ApiGateway/ApiGateway.csproj
+          src/Web/WebApp/WebApp.csproj
+        arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)/$(Build.BuildId) --no-build'
+        publishWebProjects: true
+        zipAfterPublish: true
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish build artifacts'
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)'
+        artifactName: 'drop'
+
+- stage: Security
+  displayName: 'Security Scan'
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - job: SecurityScan
+    displayName: 'Security Analysis'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - task: DotNetCoreCLI@2
+      displayName: 'Security scan with dotnet list package --vulnerable'
+      inputs:
+        command: 'custom'
+        custom: 'list'
+        arguments: 'package --vulnerable'
+        projects: '**/*.csproj'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Run security analysis'
+      inputs:
+        command: 'custom'
+        custom: 'tool'
+        arguments: 'install --global dotnet-security-scan'
+        projects: '**/*.csproj'
+
+- stage: DeployToDev
+  displayName: 'Deploy to Development'
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+  jobs:
+  - deployment: DeployToDev
+    displayName: 'Deploy to Development Environment'
+    environment: 'development'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: drop
+
+          - task: AzureCLI@2
+            displayName: 'Login to Azure'
+            inputs:
+              azureSubscription: 'Your-Azure-Subscription'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az account show
+
+          - task: AzureCLI@2
+            displayName: 'Deploy to Azure Container Registry'
+            inputs:
+              azureSubscription: 'Your-Azure-Subscription'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Build and push Docker images
+                docker build -t ecommerce-product-service:$(Build.BuildId) -f src/Services/ProductService/Dockerfile .
+                docker build -t ecommerce-order-service:$(Build.BuildId) -f src/Services/OrderService/Dockerfile .
+                docker build -t ecommerce-payment-service:$(Build.BuildId) -f src/Services/PaymentService/Dockerfile .
+                docker build -t ecommerce-notification-service:$(Build.BuildId) -f src/Services/NotificationService/Dockerfile .
+                docker build -t ecommerce-api-gateway:$(Build.BuildId) -f src/Services/ApiGateway/Dockerfile .
+                docker build -t ecommerce-webapp:$(Build.BuildId) -f src/Web/WebApp/Dockerfile .
+                
+                # Tag and push to ACR
+                az acr login --name your-acr-name
+                docker tag ecommerce-product-service:$(Build.BuildId) your-acr-name.azurecr.io/ecommerce-product-service:$(Build.BuildId)
+                docker tag ecommerce-order-service:$(Build.BuildId) your-acr-name.azurecr.io/ecommerce-order-service:$(Build.BuildId)
+                docker tag ecommerce-payment-service:$(Build.BuildId) your-acr-name.azurecr.io/ecommerce-payment-service:$(Build.BuildId)
+                docker tag ecommerce-notification-service:$(Build.BuildId) your-acr-name.azurecr.io/ecommerce-notification-service:$(Build.BuildId)
+                docker tag ecommerce-api-gateway:$(Build.BuildId) your-acr-name.azurecr.io/ecommerce-api-gateway:$(Build.BuildId)
+                docker tag ecommerce-webapp:$(Build.BuildId) your-acr-name.azurecr.io/ecommerce-webapp:$(Build.BuildId)
+                
+                docker push your-acr-name.azurecr.io/ecommerce-product-service:$(Build.BuildId)
+                docker push your-acr-name.azurecr.io/ecommerce-order-service:$(Build.BuildId)
+                docker push your-acr-name.azurecr.io/ecommerce-payment-service:$(Build.BuildId)
+                docker push your-acr-name.azurecr.io/ecommerce-notification-service:$(Build.BuildId)
+                docker push your-acr-name.azurecr.io/ecommerce-api-gateway:$(Build.BuildId)
+                docker push your-acr-name.azurecr.io/ecommerce-webapp:$(Build.BuildId)
+
+          - task: KubernetesManifest@0
+            displayName: 'Deploy to AKS'
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: 'Your-AKS-Service-Connection'
+              namespace: 'ecommerce-dev'
+              manifests: 'infrastructure/k8s/*.yml'
+              containers: 'your-acr-name.azurecr.io/ecommerce-product-service:$(Build.BuildId)'
+              imagePullSecrets: 'acr-secret'
+
+- stage: DeployToProd
+  displayName: 'Deploy to Production'
+  dependsOn: Security
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: DeployToProd
+    displayName: 'Deploy to Production Environment'
+    environment: 'production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: drop
+
+          - task: AzureCLI@2
+            displayName: 'Deploy to Production'
+            inputs:
+              azureSubscription: 'Your-Azure-Subscription'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Production deployment steps
+                az aks get-credentials --resource-group your-rg --name your-aks-cluster
+                kubectl apply -f infrastructure/k8s/production/
+                kubectl set image deployment/product-service product-service=your-acr-name.azurecr.io/ecommerce-product-service:$(Build.BuildId) -n ecommerce-prod
+                kubectl set image deployment/order-service order-service=your-acr-name.azurecr.io/ecommerce-order-service:$(Build.BuildId) -n ecommerce-prod
+                kubectl set image deployment/payment-service payment-service=your-acr-name.azurecr.io/ecommerce-payment-service:$(Build.BuildId) -n ecommerce-prod
+                kubectl set image deployment/notification-service notification-service=your-acr-name.azurecr.io/ecommerce-notification-service:$(Build.BuildId) -n ecommerce-prod
+                kubectl set image deployment/api-gateway api-gateway=your-acr-name.azurecr.io/ecommerce-api-gateway:$(Build.BuildId) -n ecommerce-prod
+                kubectl set image deployment/webapp webapp=your-acr-name.azurecr.io/ecommerce-webapp:$(Build.BuildId) -n ecommerce-prod
+
+          - task: AzureCLI@2
+            displayName: 'Update Application Gateway'
+            inputs:
+              azureSubscription: 'Your-Azure-Subscription'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Update Application Gateway backend pools
+                az network application-gateway address-pool update \
+                  --resource-group your-rg \
+                  --gateway-name your-app-gateway \
+                  --name api-backend-pool \
+                  --servers your-aks-cluster-ip
+
+- stage: PostDeployment
+  displayName: 'Post Deployment Tests'
+  dependsOn: DeployToProd
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - job: PostDeploymentTests
+    displayName: 'Run Post Deployment Tests'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - task: DotNetCoreCLI@2
+      displayName: 'Run E2E tests'
+      inputs:
+        command: 'test'
+        projects: 'tests/E2E/E2ETests.csproj'
+        arguments: '--configuration $(buildConfiguration) --no-build'
+        publishTestResults: true
+
+    - task: AzureCLI@2
+      displayName: 'Health check endpoints'
+      inputs:
+        azureSubscription: 'Your-Azure-Subscription'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Health checks
+          curl -f https://your-api-gateway-url/health || exit 1
+          curl -f https://your-product-service-url/health || exit 1
+          curl -f https://your-order-service-url/health || exit 1
+          curl -f https://your-payment-service-url/health || exit 1
+          curl -f https://your-notification-service-url/health || exit 1 
